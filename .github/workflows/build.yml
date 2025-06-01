@@ -51,9 +51,7 @@ jobs:
         working-directory: ./repository
         run: npm run gulp vscode-win32-${{ matrix.arch }}-${{ matrix.target }}-setup
 
-      - name: Rename Installer to DevForge
-        working-directory: ${{ github.workspace }}/repository/.build/win32-${{ matrix.arch }}/${{ matrix.target }}-setup
-        run: mv Flexpilot.exe DevForge.exe
+      
 
       - name: Upload DevForge Installer
         uses: actions/upload-artifact@v4
