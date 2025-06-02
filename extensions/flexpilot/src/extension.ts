@@ -88,7 +88,6 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 class AgentViewProvider implements vscode.WebviewViewProvider {
-	private _view?: vscode.WebviewView;
 	private readonly _extensionUri: vscode.Uri;
 	private readonly _context: vscode.ExtensionContext;
 	private lmHandler: VsCodeLmHandler;
@@ -127,8 +126,6 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 		_resolveContext: vscode.WebviewViewResolveContext, // Renamed as context is now a class member
 		_token: vscode.CancellationToken,
 	) {
-		this._view = webviewView;
-
 		webviewView.webview.options = {
 			// Allow scripts in the webview
 			enableScripts: true,
@@ -747,7 +744,7 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 						sendBtn.disabled = promptInput.value.trim() === '';
 					});
 
-					function escapeHtml(unsafe) {
+					function escapeHtml(unsafe: string) {
 						if (typeof unsafe !== 'string') {
 							return '';
 						}
@@ -1015,20 +1012,6 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 					updateActiveContextDisplay(null, null); // Set to "No active context." initially
 					responseArea.innerHTML = '<div class="chat-message system-message"><p>Welcome to Flexpilot Agent! Load context or type your query.</p></div>';
 
-				</script>
-			</body>
-			</html>`;
-					function escapeHtml(unsafe) {
-						if (typeof unsafe !== 'string') {
-							return '';
-						}
-						return unsafe
-							 .replace(/&/g, "&amp;")
-							 .replace(/</g, "&lt;")
-							 .replace(/>/g, "&gt;")
-							 .replace(/"/g, "&quot;")
-							 .replace(/'/g, "&#039;");
-					}
 					console.log("Flexpilot Agent webview script loaded and ready.");
 				</script>
 			</body>

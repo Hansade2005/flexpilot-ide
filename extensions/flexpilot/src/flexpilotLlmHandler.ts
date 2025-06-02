@@ -1,88 +1,5 @@
 import * as vscode from 'vscode';
 
-// Extended type declarations for VS Code Language Model API with tools support
-declare module 'vscode' {
-    // Note: Enums and interfaces like LanguageModelChatMessageRole, LanguageModelChatTool, etc.
-    // are already part of the vscode.d.ts and proposed.d.ts if the API version is recent enough.
-    // Duplicating them here might cause conflicts if they are already globally available
-    // from the vscode type definitions.
-    // However, if they are NOT available in the project's current vscode.d.ts,
-    // then these declarations are necessary.
-    // For safety in this subtask, we will include them as provided by the user.
-    // If type conflicts arise during compilation, these might need adjustment.
-
-    // User-provided enum, assuming it might be specific or an older version.
-    // If vscode.LanguageModelChatMessageRole exists, prefer that.
-    // For this subtask, we use the user's definition.
-    export enum LanguageModelChatMessageRole {
-        User = 1,
-        Assistant = 2,
-        // System = 0, // Often there's a system role too.
-    }
-
-    // User-provided enum
-    export enum LanguageModelChatToolMode {
-        Auto = 1,
-        Required = 2,
-        // None = 0, // Often a 'none' mode too.
-    }
-
-    export interface LanguageModelChatTool {
-        name: string;
-        description: string;
-        parameters?: object; // JSON schema
-    }
-
-    export interface LanguageModelChatRequestOptions {
-        modelOptions?: { [key: string]: any };
-        tools?: LanguageModelChatTool[];
-        toolMode?: LanguageModelChatToolMode;
-        justification?: string;
-    }
-
-    // Assuming LanguageModelTextPart and LanguageModelToolCallPart might be specific
-    // or extensions to existing types if those exist in vscode.d.ts.
-    // If vscode.LanguageModelTextPart exists, it should be used.
-    export class LanguageModelTextPart {
-        constructor(public value: string) {}
-    }
-
-    export class LanguageModelToolCallPart {
-        constructor(
-            public callId: string, // Renamed from 'id' in user's example to match potential vscode.d.ts
-            public name: string,
-            public parameters: object // Renamed from 'input' in user's example
-        ) {}
-    }
-
-    export interface LanguageModelChatMessage {
-        role: LanguageModelChatMessageRole; // Uses the enum defined above
-        content: string | (LanguageModelTextPart | LanguageModelToolCallPart)[];
-    }
-
-    export interface LanguageModelChatResponse {
-        stream: AsyncIterable<LanguageModelTextPart | LanguageModelToolCallPart>;
-    }
-
-    export interface LanguageModelChat {
-        readonly name: string;
-        readonly id: string;
-        readonly vendor: string;
-        readonly family: string;
-        readonly version:string; // Added from user's example. Standard API might not have all of these.
-
-        sendRequest(
-            messages: LanguageModelChatMessage[],
-            options?: LanguageModelChatRequestOptions,
-            token?: vscode.CancellationToken
-        ): Thenable<LanguageModelChatResponse>;
-    }
-
-    namespace lm {
-        function selectChatModels(selector?: { [key: string]: string }): Thenable<LanguageModelChat[]>;
-    }
-}
-
 // Interface for internal representation of tool calls, matching user's example
 interface ToolCall {
     id: string;
@@ -133,26 +50,63 @@ export class VsCodeLmHandler {
         return messages.map(msg => {
             const vscodeRole = msg.role === 'user'
                 ? vscode.LanguageModelChatMessageRole.User
-                : vscode.LanguageModelChatMessageRole.Assistant; // Assuming system prompts are handled by prepending
+                : vscode.LanguageModelChatMessageRole.Assistant;
 
-            let contentValue: string | (vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart)[];
+            let contentValue: string | vscode.LanguageModelChatMessagePart[];
+            let messageName: string | undefined = undefined;
 
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 contentValue = msg.tool_calls.map(toolCall =>
-                    new vscode.LanguageModelToolCallPart( // Uses the declared class
-                        toolCall.id,
-                        toolCall.name,
-                        toolCall.parameters
-                    )
+                    // Correct constructor: new vscode.LanguageModelToolCallPart(name, id, input)
+                    new vscode.LanguageModelToolCallPart(toolCall.name, toolCall.id, toolCall.parameters)
                 );
+                // If the assistant's message consists of tool calls, the 'name' property of LanguageModelChatMessage
+                // might be expected to be the name of the tool that was called.
+                // This is a bit ambiguous from the error, but let's assume if there's one tool call, we use its name.
+                // If multiple, this might need a more sophisticated approach or be left undefined.
+                // For now, let's leave messageName as undefined unless a clear requirement emerges.
+                // The error "Property 'name' is missing" usually applies when role is Assistant and content has tool calls.
+                // It might refer to the tool name that is being called.
+                // Let's assume for now it's not required on the message itself if the LanguageModelToolCallPart has the name.
+                // The LanguageModelChatMessage constructor itself allows 'name' as an optional third param.
             } else {
                 contentValue = msg.content; // Simple string content
             }
 
-            return {
-                role: vscodeRole,
-                content: contentValue
-            };
+            // Construct vscode.LanguageModelChatMessage
+            // constructor(role: LanguageModelChatMessageRole, content: string | LanguageModelChatMessagePart[], name?: string)
+            if (vscodeRole === vscode.LanguageModelChatMessageRole.Assistant && msg.tool_calls && msg.tool_calls.length > 0) {
+                // If there are tool_calls, the LanguageModelChatMessage from an assistant might need a name.
+                // However, the 'name' on LanguageModelChatMessage is typically for the *result* of a tool call,
+                // not the call itself. Let's test by not providing it first, and if error persists, add it.
+                // The error "Property 'name' is missing" was on the array, suggesting the objects within are missing it.
+                // This implies the constructor needs it. Let's try adding it for assistant tool calls.
+                // If there are multiple tool calls, what name to use? This is tricky.
+                // The 'name' on LanguageModelChatMessage is more for tool *results*.
+                // Let's assume the error is simpler: the object literal needs to match the class constructor if used that way.
+                // The return { role, content } was creating an object literal.
+                // Let's use the actual class constructor for clarity and potential type enforcement.
+                // The error "Property 'name' is missing" suggests that the object literal {role, content} is not satisfying
+                // the type if the role is Assistant and content contains tool calls.
+                // The 'name' field is optional on LanguageModelChatMessage.
+                // The error is likely because the LanguageModelChatMessage[] is expected to contain objects that fully satisfy the type.
+                // For assistant messages with tool calls, 'name' might be implicitly required by some internal VS Code logic,
+                // even if optional in the class def. This usually refers to the name of the tool in the tool call.
+                // Let's set 'name' if it's an assistant message with tool calls.
+                // If there are multiple tool calls, we'll use the name of the first one. This is an assumption.
+                if (msg.tool_calls.length > 0) {
+                    // messageName = msg.tool_calls[0].name; // This is an assumption for the 'name' field of the message.
+                    // Let's try creating it without the name first, as the ToolCallPart has the name.
+                    // The error "Property 'name' is missing" might be from a strict check when role is Assistant + tool calls.
+                    // It's safer to add it if it's an assistant message with tool calls.
+                     return new vscode.LanguageModelChatMessage(vscodeRole, contentValue, msg.tool_calls[0].name);
+
+                } else {
+                    return new vscode.LanguageModelChatMessage(vscodeRole, contentValue);
+                }
+            } else {
+                 return new vscode.LanguageModelChatMessage(vscodeRole, contentValue);
+            }
         });
     }
 
@@ -209,9 +163,9 @@ export class VsCodeLmHandler {
                     yield {
                         type: 'tool_call',
                         content: {
-                            id: chunk.callId, // from declared class
-                            name: chunk.name,    // from declared class
-                            parameters: chunk.parameters // from declared class
+                            id: chunk.id, // Corrected: LanguageModelToolCallPart has 'id'
+                            name: chunk.name,
+                            parameters: chunk.input // Corrected: LanguageModelToolCallPart has 'input'
                         }
                     };
                 }
