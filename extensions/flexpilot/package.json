@@ -80,7 +80,9 @@
     "url": "^0.11.4",
     "util": "^0.12.5",
     "uuid": "^11.0.3",
-    "zod": "^3.24.1"
+    "zod": "^3.24.1",
+    "diff2html": "*",
+    "highlight.js": "*"
   },
   "enabledApiProposals": [
     "activeComment",
@@ -216,6 +218,26 @@
     "showLocal"
   ],
   "contributes": {
+    "viewsContainers": {
+      "sidepanel": [
+        {
+          "id": "flexpilotAgentContainer",
+          "title": "Flexpilot Agent",
+          "icon": "assets/logo.png"
+        }
+      ]
+    },
+    "views": {
+      "flexpilotAgentContainer": [
+        {
+          "id": "flexpilot.agentView",
+          "name": "AI Agent",
+          "type": "webview",
+          "when": "flexpilot:isLoggedIn",
+          "icon": "assets/logo.png"
+        }
+      ]
+    },
     "languageModels": {
       "vendor": "copilot"
     },
