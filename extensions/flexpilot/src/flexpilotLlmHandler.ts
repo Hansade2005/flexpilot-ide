@@ -126,8 +126,7 @@ export class VsCodeLmHandler {
                 ? vscode.LanguageModelChatMessageRole.User
                 : vscode.LanguageModelChatMessageRole.Assistant;
 
-            let contentValue: string | vscode.LanguageModelChatMessagePart[];
-            let messageName: string | undefined = undefined;
+            let contentValue: string | (vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelToolResultPart)[];
 
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 contentValue = msg.tool_calls.map(toolCall =>
