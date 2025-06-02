@@ -18,7 +18,7 @@ import { registerConfigureModelCommand } from './commands/configure-model';
 import { registerUsagePreferencesCommand } from './commands/usage-preferences';
 import { registerCommitMessageCommand } from './commands/commit-message';
 import { registerShowDiagnosticsCommand } from './commands/show-diagnostics';
-import { VsCodeLmHandler } from './flexpilotLlmHandler';
+import { VsCodeLmHandler, ALL_TOOLS } from './flexpilotLlmHandler'; // Import ALL_TOOLS
 import * as Diff from 'diff';
 
 /**
@@ -91,6 +91,7 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 	private readonly _extensionUri: vscode.Uri;
 	private readonly _context: vscode.ExtensionContext;
 	private lmHandler: VsCodeLmHandler;
+	private activeModelId?: string; // Stores the ID of the currently selected language model
 
 	// State for conversational context
 	private lastUserPrompt: string | null = null;
@@ -102,22 +103,36 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 	constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
 		this._extensionUri = extensionUri;
 		this._context = context; // Store context
-		this.lmHandler = new VsCodeLmHandler({ vendor: 'copilot' }); // As per subtask
-		this.initializeLmHandler().catch(err => {
-			logger.error('Async LM Handler initialization failed:', err);
+		// Initialize activeModelId (e.g., from settings later, for now undefined or a default)
+		// For this subtask, let's keep it undefined initially to see default selection logic.
+		this.activeModelId = undefined;
+
+		// Initialize LmHandler with activeModelId if available, otherwise a default selector
+		const initialModelSelector = this.activeModelId ? { id: this.activeModelId } : { vendor: 'copilot' };
+		logger.info(`Initializing VsCodeLmHandler with selector: ${JSON.stringify(initialModelSelector)}`);
+		this.lmHandler = new VsCodeLmHandler(initialModelSelector);
+		this.initializeLmHandler(true).catch(err => { // Pass a flag for initial setup
+			logger.error('Initial LM Handler initialization failed:', err);
 		});
 	}
 
-	private async initializeLmHandler(): Promise<void> {
+	private async initializeLmHandler(isInitialSetup: boolean = false): Promise<void> {
 		try {
 			await this.lmHandler.initialize();
-			logger.info('VsCodeLmHandler initialized successfully for AgentViewProvider.');
-			// Optionally notify webview if LM is ready
-			// this._view?.webview.postMessage({ command: 'lmReady' });
+			const modelName = this.lmHandler.isInitialized() ? this.lmHandler.getClient()?.name : 'N/A';
+			logger.info(`VsCodeLmHandler initialized successfully. Model: ${modelName}`);
+			if (this.lmHandler.isInitialized() && this.lmHandler.getClient() && isInitialSetup) {
+				// If it's the initial setup and a model was successfully selected (e.g. by default selector)
+				// update activeModelId with the actually selected model's ID.
+				this.activeModelId = this.lmHandler.getClient()!.id;
+				logger.info(`Initial activeModelId set to: ${this.activeModelId}`);
+			}
+			// Optionally notify webview if LM is ready, especially after a change
+			// webviewView.webview.postMessage({ command: 'lmReady', modelId: this.activeModelId });
 		} catch (error) {
-			logger.error('Failed to initialize VsCodeLmHandler for AgentViewProvider:', error);
+			logger.error(`Failed to initialize VsCodeLmHandler: ${error instanceof Error ? error.message : String(error)}`);
 			// Optionally notify webview about the failure
-			// this._view?.webview.postMessage({ command: 'lmError', error: 'Failed to initialize Language Model.' });
+			// webviewView.webview.postMessage({ command: 'lmError', error: 'Failed to initialize Language Model.' });
 		}
 	}
 
@@ -146,6 +161,87 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 
 		webviewView.webview.onDidReceiveMessage(async (message) => {
 			switch (message.command) {
+				case 'getAvailableModels': {
+					logger.info('Webview requested available models.');
+					try {
+						// Passing an empty selector {} should get all models.
+						// Note: `vscode.lm.selectChatModels` might return models the user doesn't have access to.
+						// The `vscode.lm.chatModels` (proposed API) might be better for listing accessible models.
+						// For now, using selectChatModels as per existing patterns if lm.chatModels isn't available/used.
+						const allModels = await vscode.lm.selectChatModels({}); // Or use vscode.lm.chatModels if available & preferred
+						logger.info(`Found ${allModels.length} potential models via selectChatModels.`);
+
+						const processedModels = allModels.map(m => ({
+							id: m.id,
+							name: m.name || m.id, // Fallback to ID if name is not present
+							vendor: m.vendor,
+							family: m.family,
+							version: m.version
+						}));
+
+						// If activeModelId is not set, and we found models, set a default.
+						// Prefer a copilot model if available as a heuristic default.
+						if (!this.activeModelId && processedModels.length > 0) {
+							const copilotModel = processedModels.find(m => m.id.includes('copilot'));
+							if (copilotModel) {
+								this.activeModelId = copilotModel.id;
+								logger.info(`Default activeModelId set to Copilot model: ${this.activeModelId}`);
+							} else {
+								this.activeModelId = processedModels[0].id; // Fallback to the first model
+								logger.info(`Default activeModelId set to first available model: ${this.activeModelId}`);
+							}
+						}
+
+						webviewView.webview.postMessage({
+							command: 'availableModelsReceived',
+							models: processedModels,
+							activeModelId: this.activeModelId
+						});
+					} catch (error: any) {
+						logger.error('Failed to get available models:', error);
+						webviewView.webview.postMessage({
+							command: 'availableModelsReceived',
+							models: [],
+							error: `Failed to fetch models: ${error.message || String(error)}`
+						});
+					}
+					break;
+				}
+				case 'setSelectedModel': {
+					const modelId = message.modelId as string;
+					logger.info(`Webview requested to set model to: ${modelId}`);
+					if (this.activeModelId === modelId && this.lmHandler.isInitialized()) {
+						logger.info(`Model ${modelId} is already active and initialized. No change needed.`);
+						// Optionally, send a confirmation back if webview expects it
+						// webviewView.webview.postMessage({ command: 'modelChangeConfirmed', modelId: modelId });
+						return;
+					}
+
+					this.activeModelId = modelId;
+					logger.info(`Active model ID updated to: ${this.activeModelId}`);
+
+					// Re-initialize LmHandler with the new model ID
+					if (this.lmHandler) {
+						this.lmHandler.dispose(); // Dispose of the old handler first
+					}
+
+					logger.info(`Re-initializing VsCodeLmHandler with new model ID: ${this.activeModelId}`);
+					this.lmHandler = new VsCodeLmHandler({ id: this.activeModelId }); // Use specific ID selector
+					try {
+						await this.initializeLmHandler();
+						logger.info(`Successfully re-initialized VsCodeLmHandler with model: ${this.activeModelId}`);
+						// Confirmation can be sent if needed, but webview already shows a local message.
+						// webviewView.webview.postMessage({ command: 'modelChangeConfirmed', modelId: this.activeModelId });
+					} catch (error) {
+						logger.error(`Failed to re-initialize VsCodeLmHandler with model ${this.activeModelId}:`, error);
+						// Notify webview of the error
+						webviewView.webview.postMessage({
+							command: 'llmResponseReceived', // Reuse for general messages/errors
+							llmResponse: `Error: Failed to switch to model ${modelId}. Please try again or select another model.`
+						});
+					}
+					break;
+				}
 				case 'getActiveFileContext': {
 					const editor = vscode.window.activeTextEditor;
 					// Reset conversation history when new context is explicitly loaded
@@ -328,11 +424,36 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 					// this.lastAiResponse will be updated upon receiving the response
 
 					try {
-						logger.info('Sending request to VsCodeLmHandler.complete with constructed prompt.');
-						const llmResult = await this.lmHandler.complete(promptForLlm, systemPrompt);
+						logger.info('Sending request to VsCodeLmHandler.complete with constructed prompt and ALL_TOOLS.');
+						// Pass ALL_TOOLS to the complete method
+						const llmResult = await this.lmHandler.complete(promptForLlm, systemPrompt, ALL_TOOLS);
+
+						// Handle tool results first if any
+						if (llmResult.tool_results && llmResult.tool_results.length > 0) {
+							logger.info(`LLM executed tools. Results: ${JSON.stringify(llmResult.tool_results)}`);
+							this.lastAiResponse = JSON.stringify(llmResult.tool_results); // Store raw tool results as last AI response for context
+
+							for (const toolResult of llmResult.tool_results) {
+								const resultMsg = toolResult.result.success
+									? `Tool '${toolResult.callId}' executed successfully: ${toolResult.result.message || 'No message.'}`
+									: `Tool '${toolResult.callId}' failed: ${toolResult.result.error || 'No error details.'}`;
+
+								logger.info(`Tool execution result for ${toolResult.callId}: ${resultMsg}`);
+								webviewView.webview.postMessage({ command: 'llmResponseReceived', llmResponse: `[Tool Result] ${resultMsg}` });
+							}
+							// If there was also text, handle it after tool results.
+							// For now, assuming if tools are called, their results are the primary response for this turn.
+							// If both text and tool_results can meaningfully coexist for the webview, this logic might need adjustment.
+						}
 
 						if (llmResult.text && llmResult.text.trim() !== '') {
-							this.lastAiResponse = llmResult.text; // Store successful response for next turn
+							// If there were tool results, this text might be a summary or follow-up.
+							// If not, it's the primary response.
+							const aiTextResponse = llmResult.text;
+							this.lastAiResponse = aiTextResponse; // Update last AI response if text is primary
+							logger.info('LLM .text response received from VsCodeLmHandler.');
+
+							// Diff logic (remains the same, operates on aiTextResponse)
 							logger.info('LLM .text response received from VsCodeLmHandler.');
 
 							// Diff is only relevant if the AI's response is meant to modify the currentTurnContextContent
@@ -371,16 +492,28 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 								webviewView.webview.postMessage({ command: 'llmResponseReceived', llmResponse: llmResult.text });
 							}
 						} else if (llmResult.tool_calls && llmResult.tool_calls.length > 0) {
-							this.lastAiResponse = JSON.stringify(llmResult.tool_calls); // Store tool calls as string for context
-							const errorMsg = `LLM responded with tool calls: ${this.lastAiResponse}. This was not expected for this operation.`;
-							logger.warn('LLM responded with unexpected tool calls via VsCodeLmHandler: ' + errorMsg);
-							webviewView.webview.postMessage({ command: 'llmResponseReceived', llmResponse: errorMsg });
-						} else {
+							this.lastAiResponse = JSON.stringify(llmResult.tool_calls);
+							const toolCallInfo = `LLM requested tool calls: ${JSON.stringify(llmResult.tool_calls)}. These were executed and results logged.`;
+							logger.info(toolCallInfo);
+							// Display tool call requests only if no other response is sent.
+							// Typically, the tool_results would be shown instead of the raw request.
+							// If llmResult.text is also present, that will be shown.
+							// This message is more for debugging or if only tool calls are returned without immediate text.
+							if (!llmResult.text && (!llmResult.tool_results || llmResult.tool_results.length === 0)) {
+								webviewView.webview.postMessage({ command: 'llmResponseReceived', llmResponse: toolCallInfo });
+							}
+						} else if (!llmResult.text && (!llmResult.tool_results || llmResult.tool_results.length === 0)) {
+							// This case means no text, no tool_calls, and no tool_results.
 							this.lastAiResponse = null; // No valid response to store
-							const errorMsg = 'LLM returned an empty or whitespace-only response.';
+							const errorMsg = 'LLM returned an empty response (no text, no tool calls/results).';
 							logger.warn(errorMsg + ' via VsCodeLmHandler.');
 							webviewView.webview.postMessage({ command: 'llmResponseReceived', llmResponse: errorMsg });
 						}
+						// If only tool_results were present, a message for them has already been sent.
+						// If only text was present, it's handled by the diff logic or direct llmResponseReceived.
+						// If both, tool_results message sent, then text is handled.
+						// If only tool_calls were requested (and no results processed yet, which shouldn't happen with current complete() logic),
+						// a message about requested tool_calls is sent.
 
 					} catch (error: any) {
 						this.lastAiResponse = null; // Clear on error
@@ -438,6 +571,42 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 				<script src="${diff2htmlJsUri}"></script>
 				<script src="${highlightJsUri}"></script>
 				<style>
+					/* Model Selector Styles */
+					#model-selector-container {
+						padding: 0px 10px 12px 10px; /* Adjusted padding */
+						margin-bottom: 8px;
+						border-bottom: 1px solid var(--vscode-editorGroupHeader-tabsBorder, var(--vscode-contrastBorder));
+					}
+					#model-selector-container label {
+						display: block; /* Ensures label is on its own line */
+						margin-bottom: 6px; /* Space between label and select */
+						font-size: var(--vscode-font-size);
+						color: var(--vscode-input-placeholderForeground); /* Use a standard color for labels */
+						font-weight: bold;
+					}
+					#model-selector {
+						width: 100%;
+						padding: 6px 8px;
+						border-radius: var(--vscode-input-borderRadius, 4px);
+						border: 1px solid var(--vscode-input-border, var(--vscode-contrastBorder));
+						background-color: var(--vscode-input-background);
+						color: var(--vscode-input-foreground);
+						font-family: var(--vscode-font-family);
+						font-size: var(--vscode-font-size);
+						height: 32px; /* Explicit height for better alignment */
+						box-sizing: border-box; /* Include padding and border in the element's total width and height */
+					}
+					#model-selector:focus {
+						outline: none;
+						border-color: var(--vscode-focusBorder);
+						box-shadow: 0 0 0 1px var(--vscode-focusBorder); /* Standard focus indicator */
+					}
+					#model-selector option {
+						background-color: var(--vscode-input-background);
+						color: var(--vscode-input-foreground);
+					}
+					/* End Model Selector Styles */
+
 					body, html {
 						height: 100%;
 						margin: 0;
@@ -715,12 +884,20 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 					<span id="context-text-element">No active context.</span>
 					<button id="clear-context-btn" class="clear-context-button" style="display:none;" title="Clear Context">✖</button>
 				</div>
+
+				<div id="model-selector-container">
+					<label for="model-selector">Select Model:</label>
+					<select id="model-selector" name="model-selector">
+						<option value="">Loading models...</option>
+					</select>
+				</div>
+
 				<textarea id="prompt-input" placeholder="Send a message to Flexpilot Agent..." rows="3"></textarea>
-				<div class="button-group">
+				<div class="button-group"> {/* Main button group */}
 					<button id="getActiveFileBtn">Use Active File Context</button>
 					<button id="getSelectionBtn">Use Selection Context</button>
 					<button id="clearChatBtn">Clear Chat</button>
-					<button id="sendPromptBtn">Send to AI</button>
+					<button id="sendPromptBtn">Send to AI</button> {/* sendPromptBtn restored here */}
 				</div>
 				<div id="response-area">
 					<!-- Chat messages will be appended here -->
@@ -734,14 +911,35 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 					const clearContextBtn = document.getElementById('clear-context-btn'); // The clear button
 					const sendBtn = document.getElementById('sendPromptBtn');
 					const clearChatBtn = document.getElementById('clearChatBtn');
+					const modelSelector = document.getElementById('model-selector');
 
 					let currentContext = { type: '', content: '' };
 					let currentSuggestion = { modifiedContent: '', contextType: '', selectionDetails: null };
 
-					// Initial state for send button
+					// Initial state for send button & model selector
 					sendBtn.disabled = true;
+					modelSelector.disabled = true; // Disable until models are loaded
+
 					promptInput.addEventListener('input', () => {
 						sendBtn.disabled = promptInput.value.trim() === '';
+					});
+
+					// Request available models when the script loads
+					console.log("Requesting available models...");
+					vscode.postMessage({ command: 'getAvailableModels' });
+
+					modelSelector.addEventListener('change', () => {
+						const selectedModelId = modelSelector.value;
+						console.log(`Model selection changed to: ${selectedModelId}`);
+						if (selectedModelId) {
+							vscode.postMessage({ command: 'setSelectedModel', modelId: selectedModelId });
+							// Optionally, add a system message to responseArea confirming selection
+							const confirmMsgDiv = document.createElement('div');
+							confirmMsgDiv.className = 'chat-message system-message';
+							confirmMsgDiv.innerHTML = `<p>Model set to: ${modelSelector.options[modelSelector.selectedIndex].text}</p>`;
+							responseArea.appendChild(confirmMsgDiv);
+							responseArea.scrollTop = responseArea.scrollHeight;
+						}
 					});
 
 					function escapeHtml(unsafe: string) {
@@ -928,6 +1126,47 @@ class AgentViewProvider implements vscode.WebviewViewProvider {
 
 
 						switch (message.command) {
+							case 'availableModelsReceived':
+								console.log("Received availableModelsReceived:", message.models);
+								modelSelector.innerHTML = ''; // Clear existing options (e.g., "Loading models...")
+								if (message.models && message.models.length > 0) {
+									// Add a default "Select a Model" option if desired, or just list models
+									// const defaultOption = document.createElement('option');
+									// defaultOption.value = "";
+									// defaultOption.textContent = "Select a language model";
+									// modelSelector.appendChild(defaultOption);
+
+									message.models.forEach(model => {
+										const option = document.createElement('option');
+										option.value = model.id;
+										// Try to create a user-friendly name
+										let displayName = model.name || model.id;
+										if (model.vendor) {
+											displayName = `[${model.vendor}] ${displayName}`;
+										} else if (model.id.includes('copilot')) { // Specific example
+											displayName = `[GitHub] Copilot (${model.id.split('/').pop()})`;
+										}
+										option.textContent = displayName;
+										modelSelector.appendChild(option);
+									});
+									modelSelector.disabled = false; // Enable selector
+
+									// Try to pre-select the active model if provided
+									if (message.activeModelId) {
+										modelSelector.value = message.activeModelId;
+										console.log(`Pre-selected active model: ${message.activeModelId}`);
+									} else {
+										console.log("No active model ID provided for pre-selection.");
+									}
+
+								} else {
+									const option = document.createElement('option');
+									option.value = "";
+									option.textContent = "No models available";
+									modelSelector.appendChild(option);
+									modelSelector.disabled = true; // Keep it disabled
+								}
+								break;
 							case 'contextReceived':
 								currentContext.type = message.type;
 								currentContext.content = message.content;

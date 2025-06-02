@@ -1,4 +1,9 @@
 import * as vscode from 'vscode';
+import {
+    createFile, editFile, deleteFile, runTerminalCommand,
+    CreateFileParams, EditFileParams, DeleteFileParams, RunCommandParams,
+    ToolResult
+} from './tools';
 
 // Interface for internal representation of tool calls, matching user's example
 interface ToolCall {
@@ -6,6 +11,71 @@ interface ToolCall {
     name: string;
     parameters: object;
 }
+
+// --- Tool Definitions for LLM ---
+
+export const CREATE_FILE_TOOL: vscode.LanguageModelChatTool = {
+    name: 'create_file',
+    description: 'Creates a new file at the specified path with optional content. Path should be relative to the workspace root. Fails if the file already exists.',
+    parameters: {
+        type: 'object',
+        properties: {
+            path: { type: 'string', description: 'Relative path to the new file (e.g., "src/newFile.ts").' },
+            content: { type: 'string', description: 'Optional initial content for the file.' }
+        },
+        required: ['path']
+    }
+};
+
+export const EDIT_FILE_TOOL: vscode.LanguageModelChatTool = {
+    name: 'edit_file',
+    description: 'Edits an existing file by overwriting its content. Path should be relative to the workspace root. Fails if the file does not exist.',
+    parameters: {
+        type: 'object',
+        properties: {
+            path: { type: 'string', description: 'Relative path to the file to be edited (e.g., "src/existingFile.ts").' },
+            content: { type: 'string', description: 'The new content for the file.' }
+        },
+        required: ['path', 'content']
+    }
+};
+
+export const DELETE_FILE_TOOL: vscode.LanguageModelChatTool = {
+    name: 'delete_file',
+    description: 'Deletes a file at the specified path. Path should be relative to the workspace root. Fails if the file does not exist.',
+    parameters: {
+        type: 'object',
+        properties: {
+            path: { type: 'string', description: 'Relative path to the file to be deleted (e.g., "src/obsoleteFile.ts").' }
+        },
+        required: ['path']
+    }
+};
+
+export const RUN_TERMINAL_COMMAND_TOOL: vscode.LanguageModelChatTool = {
+    name: 'run_terminal_command',
+    description: 'Runs a command in the integrated terminal. Does not capture output directly, but indicates if the command was sent.',
+    parameters: {
+        type: 'object',
+        properties: {
+            command: { type: 'string', description: 'The command to run (e.g., "npm", "ls", "python").' },
+            args: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional array of arguments for the command (e.g., ["install", "my-package"]).'
+            }
+        },
+        required: ['command']
+    }
+};
+
+// Array of all available tools for easy passing to the LLM handler
+export const ALL_TOOLS: vscode.LanguageModelChatTool[] = [
+    CREATE_FILE_TOOL,
+    EDIT_FILE_TOOL,
+    DELETE_FILE_TOOL,
+    RUN_TERMINAL_COMMAND_TOOL
+];
 
 // Interface for internal representation of chat messages, matching user's example
 interface ChatMessage {
@@ -23,6 +93,10 @@ export class VsCodeLmHandler {
 
     public isInitialized(): boolean {
         return this.initialized && !!this.client;
+    }
+
+    public getClient(): vscode.LanguageModelChat | null {
+        return this.client;
     }
 
     async initialize(): Promise<void> {
@@ -179,28 +253,55 @@ export class VsCodeLmHandler {
     async complete(
         prompt: string,
         systemPrompt?: string,
-        tools?: vscode.LanguageModelChatTool[] // from parameter
-    ): Promise<{ text?: string; tool_calls?: ToolCall[] }> {
+        availableTools: vscode.LanguageModelChatTool[] = ALL_TOOLS // Default to all defined tools
+    ): Promise<{ text?: string; tool_calls?: ToolCall[]; tool_results?: { callId: string; result: ToolResult }[] }> {
         let text = '';
         const tool_calls: ToolCall[] = [];
+        const tool_results: { callId: string; result: ToolResult }[] = [];
 
-        // Use the systemPrompt in the options for the chat method
+        // Use the systemPrompt and availableTools in the options for the chat method
         for await (const chunk of this.chat(
             [{ role: 'user', content: prompt }],
-            tools, // Pass tools to chat
+            availableTools, // Pass available tools to chat method
             { systemPrompt } // Pass systemPrompt to chat options
         )) {
             if (chunk.type === 'text') {
                 text += chunk.content;
-            } else {
-                // Ensure chunk.content is treated as ToolCall
-                tool_calls.push(chunk.content as ToolCall);
+            } else if (chunk.type === 'tool_call') {
+                const toolCallData = chunk.content as ToolCall; // ToolCall is {id, name, parameters}
+                tool_calls.push(toolCallData); // Record the requested tool call
+
+                let toolExecutionResult: ToolResult;
+                try {
+                    switch (toolCallData.name) {
+                        case CREATE_FILE_TOOL.name:
+                            toolExecutionResult = await createFile(toolCallData.parameters as CreateFileParams);
+                            break;
+                        case EDIT_FILE_TOOL.name:
+                            toolExecutionResult = await editFile(toolCallData.parameters as EditFileParams);
+                            break;
+                        case DELETE_FILE_TOOL.name:
+                            toolExecutionResult = await deleteFile(toolCallData.parameters as DeleteFileParams);
+                            break;
+                        case RUN_TERMINAL_COMMAND_TOOL.name:
+                            toolExecutionResult = await runTerminalCommand(toolCallData.parameters as RunCommandParams);
+                            break;
+                        default:
+                            console.error(`Unknown tool called: ${toolCallData.name}`);
+                            toolExecutionResult = { success: false, error: `Unknown tool: ${toolCallData.name}` };
+                    }
+                } catch (error: any) {
+                    console.error(`Error executing tool ${toolCallData.name}:`, error);
+                    toolExecutionResult = { success: false, error: `Error executing tool ${toolCallData.name}: ${error.message || String(error)}` };
+                }
+                tool_results.push({ callId: toolCallData.id, result: toolExecutionResult });
             }
         }
 
         return {
-            ...(text ? { text } : {}),
-            ...(tool_calls.length > 0 ? { tool_calls } : {}) // Ensure it's > 0
+            ...(text && { text }), // Add text if it exists
+            ...(tool_calls.length > 0 && { tool_calls }), // Add tool_calls if any
+            ...(tool_results.length > 0 && { tool_results }) // Add tool_results if any
         };
     }
 
